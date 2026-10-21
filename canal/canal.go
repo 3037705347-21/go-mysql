@@ -38,6 +38,10 @@ type Canal struct {
 	dumpDoneCh chan struct{}
 	syncer     *replication.BinlogSyncer
 
+	// sourceRoster holds the persistent GTID source attribution record. Nil
+	// unless cfg.SourceRoster is set or cfg.SourceAttributionFile is configured.
+	sourceRoster *replication.SourceRoster
+
 	eventHandler EventHandler
 
 	connLock sync.Mutex
@@ -269,7 +273,46 @@ func (c *Canal) Close() {
 	}
 	c.connLock.Unlock()
 
+	if c.sourceRoster != nil {
+		if err := c.sourceRoster.Flush(); err != nil {
+			c.cfg.Logger.Error("failed to flush gtid source attribution record", slog.Any("error", err))
+		}
+	}
+
 	_ = c.eventHandler.OnPosSynced(nil, c.master.Position(), c.master.GTIDSet(), true)
+}
+
+// SourceRoster returns the persistent GTID source attribution record in use,
+// or nil when source gating is not enabled.
+func (c *Canal) SourceRoster() *replication.SourceRoster {
+	return c.sourceRoster
+}
+
+// TakeoverGTIDSource explicitly trusts the instance currently held in
+// quarantine after a primary switchover and archives the previous trusted
+// instance into the provenance history.
+//
+// A quarantine makes Run return (like any fatal sync error) and the Canal
+// context is cancelled, so resume by constructing a new Canal configured with
+// the same SourceAttributionFile (or the same SourceRoster) and starting it at
+// the desired GTID set; the persisted decision lets the new instance through.
+// The current synced GTID set is recorded as the hand-off high-water mark;
+// call SourceRoster().Takeover with an explicit identity and GTID set when the
+// new instance should start from a different set or when the quarantine reason
+// was "undetermined".
+func (c *Canal) TakeoverGTIDSource() error {
+	if c.sourceRoster == nil {
+		return errors.New("gtid source attribution is not enabled")
+	}
+	gset := c.master.GTIDSet()
+	gsetStr := ""
+	if gset != nil {
+		gsetStr = gset.String()
+	}
+	if err := c.sourceRoster.TakeoverPending(gsetStr); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
 }
 
 func (c *Canal) WaitDumpDone() <-chan struct{} {
@@ -447,6 +490,16 @@ func (c *Canal) checkBinlogRowFormat() error {
 }
 
 func (c *Canal) prepareSyncer() error {
+	if c.cfg.SourceRoster != nil {
+		c.sourceRoster = c.cfg.SourceRoster
+	} else if c.cfg.SourceAttributionFile != "" {
+		roster, err := replication.OpenSourceRoster(c.cfg.SourceAttributionFile, c.cfg.Logger)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		c.sourceRoster = roster
+	}
+
 	cfg := replication.BinlogSyncerConfig{
 		ServerID:                c.cfg.ServerID,
 		Flavor:                  c.cfg.Flavor,
@@ -467,6 +520,7 @@ func (c *Canal) prepareSyncer() error {
 		Localhost:               c.cfg.Localhost,
 		EventCacheCount:         c.cfg.EventCacheCount,
 		FillZeroLogPos:          c.cfg.FillZeroLogPos,
+		SourceRoster:            c.sourceRoster,
 
 		RowsEventDecodeFunc: func(event *replication.RowsEvent, data []byte) error {
 			pos, err := event.DecodeHeader(data)

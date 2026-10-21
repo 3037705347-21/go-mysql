@@ -13,6 +13,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/client"
 	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/go-mysql-org/go-mysql/utils"
 )
 
@@ -119,6 +120,21 @@ type Config struct {
 	// to ensure correct position calculation in MariaDB 11.4+.
 	// Only works with MariaDB flavor.
 	FillZeroLogPos bool
+
+	// SourceAttributionFile is the path of the persistent GTID source
+	// attribution record. When non-empty, canal gates GTID incremental sync on
+	// the feeding instance's identity: reconnecting to the same instance keeps
+	// the normal retry behaviour, a different instance behind the same address
+	// (primary switchover) or an identity that cannot be determined quarantines
+	// sync, and Run only resumes after TakeoverGTIDSource. Empty keeps the
+	// legacy behaviour. A SourceRoster set directly takes precedence over this
+	// path.
+	SourceAttributionFile string `toml:"source_attribution_file"`
+
+	// SourceRoster wires a fully controlled, externally owned attribution
+	// record (custom SourceStore, custom flush interval). When set it takes
+	// precedence over SourceAttributionFile.
+	SourceRoster *replication.SourceRoster
 }
 
 func NewConfigWithFile(name string) (*Config, error) {

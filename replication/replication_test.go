@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"path"
 	"strconv"
@@ -391,6 +392,91 @@ func (t *testSyncerSuite) TestMysqlGTIDSync() {
 	require.NoError(t.T(), err)
 
 	t.testSync(s)
+}
+
+// TestMysqlGTIDSourceRoster exercises source attribution against a live MySQL
+// GTID server: adoption on first contact, same-identity reconnect after a read
+// failure, persistence across reload and rejection of a pre-trusted stranger.
+func (t *testSyncerSuite) TestMysqlGTIDSourceRoster() {
+	t.setupTest(mysql.MySQLFlavor)
+
+	r, err := t.c.Execute("SELECT @@gtid_mode")
+	require.NoError(t.T(), err)
+	modeOn, _ := r.GetString(0, 0)
+	if modeOn != "ON" {
+		t.T().Skip("GTID mode is not ON")
+	}
+
+	r, err = t.c.Execute("SHOW GLOBAL VARIABLES LIKE 'SERVER_UUID'")
+	require.NoError(t.T(), err)
+	masterUUID, _ := r.GetString(0, 1)
+	require.Len(t.T(), masterUUID, 36)
+
+	set, err := mysql.ParseMysqlGTIDSet(fmt.Sprintf("%s:%d-%d", masterUUID, 1, 2))
+	require.NoError(t.T(), err)
+
+	// Reconfigure the suite syncer with a roster on a fresh temp file.
+	t.b.Close()
+	rosterPath := path.Join(t.T().TempDir(), "source-roster.json")
+	roster, err := OpenSourceRoster(rosterPath, slog.Default())
+	require.NoError(t.T(), err)
+
+	gatedCfg := t.b.cfg
+	gatedCfg.ServerID = 105
+	gatedCfg.SourceRoster = roster
+	t.b = NewBinlogSyncer(gatedCfg)
+
+	// First contact adopts the real server and persists immediately.
+	s, err := t.b.StartSyncGTID(set)
+	require.NoError(t.T(), err)
+	rec := roster.Attribution()
+	require.Equal(t.T(), SourceStateTrusted, rec.State)
+	require.Equal(t.T(), masterUUID, rec.Current.ServerUUID)
+	require.Equal(t.T(), masterUUID, t.b.LastSourceIdentity().ServerUUID)
+
+	stored, err := NewFileSourceStore(rosterPath).Load()
+	require.NoError(t.T(), err)
+	require.Equal(t.T(), SourceStateTrusted, stored.State)
+	require.Equal(t.T(), masterUUID, stored.Current.ServerUUID)
+
+	// Force the read side to fail: internal reconnect must re-verify the same
+	// identity and keep streaming, exactly like the ungated retry path.
+	_ = t.b.c.SetReadDeadline(utils.Now().Add(time.Millisecond))
+	readCtx, cancelRead := context.WithTimeout(context.Background(), 4*time.Second)
+	for {
+		_, getErr := s.GetEvent(readCtx)
+		if getErr == nil {
+			continue // live server may push real binlog events
+		}
+		require.ErrorIs(t.T(), getErr, context.DeadlineExceeded)
+		break
+	}
+	cancelRead()
+	require.Equal(t.T(), SourceStateTrusted, roster.State())
+	require.Equal(t.T(), masterUUID, t.b.LastSourceIdentity().ServerUUID)
+
+	// Reloading the file (as a restarted process would) shows the trusted source.
+	reloaded, err := OpenSourceRoster(rosterPath, slog.Default())
+	require.NoError(t.T(), err)
+	require.Equal(t.T(), SourceStateTrusted, reloaded.State())
+	require.Equal(t.T(), masterUUID, reloaded.Attribution().Current.ServerUUID)
+
+	// A roster that already trusts a stranger must quarantine the real server
+	// on the very first dump connection.
+	t.b.Close()
+	strangerStore := &memSourceStore{}
+	strangerRoster, err := NewSourceRoster(strangerStore, slog.Default())
+	require.NoError(t.T(), err)
+	require.NoError(t.T(), strangerRoster.Verify(mysqlIdentity("cccccccc-3333-3333-3333-333333333333")))
+
+	gatedCfg.SourceRoster = strangerRoster
+	t.b = NewBinlogSyncer(gatedCfg)
+	_, err = t.b.StartSyncGTID(set)
+	require.ErrorIs(t.T(), err, ErrUnknownSource)
+	require.Equal(t.T(), SourceStateQuarantined, strangerRoster.State())
+	pending, ok := strangerRoster.Pending()
+	require.True(t.T(), ok)
+	require.Equal(t.T(), masterUUID, pending.Identity.ServerUUID)
 }
 
 func (t *testSyncerSuite) TestMariadbPositionSync() {

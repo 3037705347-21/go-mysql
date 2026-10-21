@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	stderrors "errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -173,6 +174,15 @@ type BinlogSyncerConfig struct {
 	// This should not be used together with StartBackupWithHandler.
 	// If this is not nil, GetEvent does not need to be called.
 	SynchronousEventHandler EventHandler `json:"-"`
+
+	// SourceRoster, when set, gates every GTID dump connection on a persistent
+	// record of the feeding instance's identity. A reconnect to the same
+	// instance keeps the normal retry behaviour; a different instance behind
+	// the same address (primary switchover) or an identity that cannot be
+	// determined quarantines the stream with ErrUnknownSource /
+	// ErrSourceUndetermined until SourceRoster.Takeover is called explicitly.
+	// Nil preserves the legacy behaviour of merging every source's GTIDs.
+	SourceRoster *SourceRoster `json:"-"`
 }
 
 // EventHandler defines the interface for processing binlog events.
@@ -207,6 +217,10 @@ type BinlogSyncer struct {
 	lastConnectionID uint32
 
 	retryCount int
+
+	// lastSourceIdentity is the identity observed on the most recent gated
+	// GTID connection; zero when SourceRoster is unset or never connected.
+	lastSourceIdentity SourceIdentity
 }
 
 // NewBinlogSyncer creates the BinlogSyncer with the given configuration.
@@ -528,25 +542,12 @@ func (b *BinlogSyncer) StartSyncGTID(gset mysql.GTIDSet) (*BinlogStreamer, error
 		return nil, errors.Trace(errSyncRunning)
 	}
 
-	// establishing network connection here and will start getting binlog events from "gset + 1", thus until first
-	// MariadbGTIDEvent/GTIDEvent event is received - we effectively do not have a "current GTID"
-	b.currGset = nil
-
-	if err := b.prepare(); err != nil {
+	// prepareSyncGTID connects, verifies the instance against the source roster
+	// and starts getting binlog events from "gset + 1"; until the first
+	// MariadbGTIDEvent/GTIDEvent event is received we effectively do not have
+	// a "current GTID".
+	if err := b.prepareSyncGTID(gset); err != nil {
 		return nil, errors.Trace(err)
-	}
-
-	var err error
-	switch b.cfg.Flavor {
-	case mysql.MariaDBFlavor:
-		err = b.writeBinlogDumpMariadbGTIDCommand(gset)
-	default:
-		// default use MySQL
-		err = b.writeBinlogDumpMysqlGTIDCommand(gset)
-	}
-
-	if err != nil {
-		return nil, err
 	}
 
 	b.checkFlavor()
@@ -776,6 +777,12 @@ func (b *BinlogSyncer) prepareSyncGTID(gset mysql.GTIDSet) error {
 		return errors.Trace(err)
 	}
 
+	// Gate the connection on persistent instance identity before issuing the
+	// dump command, so no event of an untrusted source can reach consumers.
+	if err = b.verifyGTIDSource(); err != nil {
+		return errors.Trace(err)
+	}
+
 	switch b.cfg.Flavor {
 	case mysql.MariaDBFlavor:
 		err = b.writeBinlogDumpMariadbGTIDCommand(gset)
@@ -788,6 +795,99 @@ func (b *BinlogSyncer) prepareSyncGTID(gset mysql.GTIDSet) error {
 		return err
 	}
 	return nil
+}
+
+// sourceAddr returns host:port the syncer connects to, recorded for forensics
+// only (it is deliberately not part of source identity comparison).
+func (b *BinlogSyncer) sourceAddr() string {
+	if b.cfg.Port != 0 {
+		return net.JoinHostPort(b.cfg.Host, strconv.Itoa(int(b.cfg.Port)))
+	}
+	return b.cfg.Host
+}
+
+// fetchSourceIdentity queries a freshly connected instance for its durable
+// identity. MySQL is identified by its server_uuid (the SID prefix of its
+// GTIDs), MariaDB by gtid_domain_id + server_id with server_uuid recorded when
+// available. A query failure is returned to the caller, which quarantines the
+// connection instead of guessing.
+func (b *BinlogSyncer) fetchSourceIdentity() (SourceIdentity, error) {
+	id := SourceIdentity{Flavor: b.cfg.Flavor, Addr: b.sourceAddr()}
+
+	rr, err := b.c.Execute("SELECT @@GLOBAL.server_uuid")
+	if err != nil {
+		// MariaDB versions without a server_uuid variable are expected; on
+		// MySQL this variable always exists and its absence is undetermined.
+		if b.cfg.Flavor != mysql.MariaDBFlavor {
+			return id, errors.Trace(err)
+		}
+	} else if rr != nil {
+		if s, e := rr.GetString(0, 0); e == nil {
+			id.ServerUUID = strings.TrimSpace(s)
+		}
+	}
+
+	if b.cfg.Flavor == mysql.MariaDBFlavor {
+		rr, err := b.c.Execute("SELECT @@GLOBAL.gtid_domain_id, @@GLOBAL.server_id")
+		if err != nil {
+			return id, errors.Trace(err)
+		}
+		domain, _ := rr.GetInt(0, 0)
+		serverID, _ := rr.GetInt(0, 1)
+		id.DomainID = uint32(domain)
+		id.ServerID = uint32(serverID)
+	}
+
+	return id, nil
+}
+
+// verifyGTIDSource checks the connected instance against the persistent source
+// roster before a binlog dump is accepted. When the identity cannot be read,
+// an empty identity is handed to the roster so that it is quarantined as
+// undetermined rather than silently trusted.
+func (b *BinlogSyncer) verifyGTIDSource() error {
+	if b.cfg.SourceRoster == nil {
+		return nil
+	}
+	id, err := b.fetchSourceIdentity()
+	if err != nil {
+		b.cfg.Logger.Error("failed to determine gtid source identity", slog.Any("error", err))
+		id = SourceIdentity{Flavor: b.cfg.Flavor, Addr: b.sourceAddr()}
+	}
+	b.lastSourceIdentity = id
+	if err := b.cfg.SourceRoster.Verify(id); err != nil {
+		return errors.Trace(err)
+	}
+	return nil
+}
+
+// LastSourceIdentity returns the identity observed on the latest gated
+// connection. The zero value is returned when SourceRoster is disabled or the
+// syncer has not connected yet.
+func (b *BinlogSyncer) LastSourceIdentity() SourceIdentity {
+	b.m.RLock()
+	defer b.m.RUnlock()
+	return b.lastSourceIdentity
+}
+
+// checkpointSourceRoster attributes the current high-water GTID set to the
+// trusted source at transaction-commit cadence.
+func (b *BinlogSyncer) checkpointSourceRoster() {
+	if b.cfg.SourceRoster == nil {
+		return
+	}
+	gset := b.getCurrentGtidSet()
+	if gset == nil {
+		return
+	}
+	b.cfg.SourceRoster.Checkpoint(gset.String())
+}
+
+// isSourceQuarantineError reports whether a retry failure must stop the stream
+// rather than trigger another reconnect attempt.
+func isSourceQuarantineError(err error) bool {
+	return stderrors.Is(err, ErrUnknownSource) || stderrors.Is(err, ErrSourceUndetermined) ||
+		errors.Cause(err) == ErrUnknownSource || errors.Cause(err) == ErrSourceUndetermined
 }
 
 func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
@@ -831,6 +931,23 @@ func (b *BinlogSyncer) onStream(s *BinlogStreamer) {
 				case <-time.After(time.Second):
 					b.retryCount++
 					if err = b.retrySync(); err != nil {
+						if isSourceQuarantineError(err) {
+							// The reconnected instance is not the trusted
+							// source (or cannot be identified). This is a
+							// switchover decision, not a network blip, so stop
+							// the stream instead of merging its GTIDs. The
+							// roster persists the suspect identity and sync
+							// only resumes after an explicit Takeover.
+							b.cfg.Logger.Error(
+								"gtid source quarantined, stopping sync pending explicit takeover",
+								slog.Any("error", err),
+							)
+							b.m.Lock()
+							b.running = false
+							b.m.Unlock()
+							s.closeWithError(err)
+							return
+						}
 						if b.cfg.MaxReconnectAttempts > 0 && b.retryCount >= b.cfg.MaxReconnectAttempts {
 							b.cfg.Logger.Error(
 								"retry sync err, exceeded max retries",
@@ -1006,11 +1123,13 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 	case *XIDEvent:
 		if !b.cfg.DiscardGTIDSet {
 			event.GSet = b.getCurrentGtidSet()
+			b.checkpointSourceRoster()
 		}
 
 	case *QueryEvent:
 		if !b.cfg.DiscardGTIDSet {
 			event.GSet = b.getCurrentGtidSet()
+			b.checkpointSourceRoster()
 		}
 
 	case *TransactionPayloadEvent:
@@ -1022,8 +1141,10 @@ func (b *BinlogSyncer) handleEventAndACK(s *BinlogStreamer, e *BinlogEvent, need
 				switch innerEvent := inner.Event.(type) {
 				case *XIDEvent:
 					innerEvent.GSet = b.getCurrentGtidSet()
+					b.checkpointSourceRoster()
 				case *QueryEvent:
 					innerEvent.GSet = b.getCurrentGtidSet()
+					b.checkpointSourceRoster()
 				}
 			}
 		}
