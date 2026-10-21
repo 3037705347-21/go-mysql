@@ -217,12 +217,20 @@ func (c *Canal) StartFromGTID(set mysql.GTIDSet) error {
 }
 
 // Dump all data from MySQL master `mysqldump`, ignore sync binlog.
+// When Dump.StateDir is configured, the snapshot is resumable and the
+// snapshot/incremental handoff is committed; binlog sync itself is not run.
 func (c *Canal) Dump() error {
 	if c.dumped {
 		return errors.New("the method Dump can't be called twice")
 	}
 	c.dumped = true
 	defer close(c.dumpDoneCh)
+	if c.cfg.Dump.StateDir != "" {
+		if c.dumper == nil {
+			return errors.New("mysqldump does not exist")
+		}
+		return c.resumableDump()
+	}
 	return c.dump()
 }
 

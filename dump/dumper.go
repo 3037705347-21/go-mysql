@@ -210,8 +210,37 @@ func (d *Dumper) Reset() {
 	d.Where = ""
 }
 
-func (d *Dumper) Dump(w io.Writer) error {
-	args := make([]string, 0, 16)
+// dumpTarget identifies a schema (when table is empty) or a single table
+// to pass to mysqldump as a positional argument.
+type dumpTarget struct {
+	db    string
+	table string
+}
+
+// configuredTargets translates the Dumper configuration into the list of
+// objects a dump should cover.
+func (d *Dumper) configuredTargets() []dumpTarget {
+	if len(d.Tables) == 0 {
+		targets := make([]dumpTarget, 0, len(d.Databases))
+		for _, db := range d.Databases {
+			targets = append(targets, dumpTarget{db: db})
+		}
+		return targets
+	}
+
+	targets := make([]dumpTarget, 0, len(d.Tables))
+	for _, table := range d.Tables {
+		targets = append(targets, dumpTarget{db: d.TableDB, table: table})
+	}
+	return targets
+}
+
+// buildArgs assembles the mysqldump command line for the given targets.
+// When tables are dumped positionally, mysqldump does not emit a USE
+// statement, so useDB names the database that the caller must write to the
+// output stream itself.
+func (d *Dumper) buildArgs(targets []dumpTarget) (args []string, useDB string) {
+	args = make([]string, 0, 32)
 
 	// Common args
 	if strings.Contains(d.Addr, "/") {
@@ -229,9 +258,7 @@ func (d *Dumper) Dump(w io.Writer) error {
 	}
 
 	args = append(args, fmt.Sprintf("--user=%s", d.User))
-	passwordArg := fmt.Sprintf("--password=%s", d.Password)
-	args = append(args, passwordArg)
-	passwordArgIndex := len(args) - 1
+	args = append(args, fmt.Sprintf("--password=%s", d.Password))
 
 	if !d.masterDataSkipped {
 		if d.sourceDataSupported {
@@ -291,33 +318,86 @@ func (d *Dumper) Dump(w io.Writer) error {
 		args = append(args, `--column-statistics=0`)
 	}
 
-	if len(d.Tables) == 0 && len(d.Databases) == 0 {
+	switch {
+	case len(targets) == 0:
 		args = append(args, "--all-databases")
-	} else if len(d.Tables) == 0 {
+	case allTargetsDatabases(targets):
 		args = append(args, "--databases")
-		args = append(args, d.Databases...)
-	} else {
-		args = append(args, d.TableDB)
-		args = append(args, d.Tables...)
-
-		// If we only dump some tables, the dump data will not have database name
-		// which makes us hard to parse, so here we add it manually.
-
-		_, err := fmt.Fprintf(w, "USE `%s`;\n", d.TableDB)
-		if err != nil {
-			return fmt.Errorf(`could not write USE command: %w`, err)
+		for _, target := range targets {
+			args = append(args, target.db)
+		}
+	default:
+		// mysqldump only accepts tables of a single database as positional
+		// arguments; every table target must share the same database.
+		useDB = targets[0].db
+		args = append(args, targets[0].db)
+		for _, target := range targets {
+			args = append(args, target.table)
 		}
 	}
 
-	args[passwordArgIndex] = "--password=******"
-	d.Logger.Info("exec mysqldump with", slog.Any("args", args))
-	args[passwordArgIndex] = passwordArg
+	return args, useDB
+}
+
+func allTargetsDatabases(targets []dumpTarget) bool {
+	for _, target := range targets {
+		if target.table != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// run executes mysqldump with args, streaming its stdout to w.
+func (d *Dumper) run(args []string, w io.Writer) error {
+	logArgs := make([]string, len(args))
+	for i, arg := range args {
+		if strings.HasPrefix(arg, "--password=") {
+			logArgs[i] = "--password=******"
+		} else {
+			logArgs[i] = arg
+		}
+	}
+	d.Logger.Info("exec mysqldump with", slog.Any("args", logArgs))
+
 	cmd := exec.Command(d.ExecutionPath, args...)
 
 	cmd.Stderr = d.ErrOut
 	cmd.Stdout = w
 
 	return cmd.Run()
+}
+
+// writeUsePrefix emits the USE statement mysqldump omits when tables are
+// dumped positionally.
+func writeUsePrefix(w io.Writer, db string) error {
+	if _, err := fmt.Fprintf(w, "USE `%s`;\n", db); err != nil {
+		return fmt.Errorf(`could not write USE command: %w`, err)
+	}
+	return nil
+}
+
+func (d *Dumper) Dump(w io.Writer) error {
+	args, useDB := d.buildArgs(d.configuredTargets())
+	if useDB != "" {
+		if err := writeUsePrefix(w, useDB); err != nil {
+			return err
+		}
+	}
+	return d.run(args, w)
+}
+
+// DumpTable dumps a single table with the same options configured on the
+// Dumper. It is the resumable snapshot unit: callers can dump tables one by
+// one and skip the ones already delivered downstream.
+func (d *Dumper) DumpTable(db, table string, w io.Writer) error {
+	args, useDB := d.buildArgs([]dumpTarget{{db: db, table: table}})
+	if useDB != "" {
+		if err := writeUsePrefix(w, useDB); err != nil {
+			return err
+		}
+	}
+	return d.run(args, w)
 }
 
 // DumpAndParse: Dump MySQL and parse immediately
@@ -332,6 +412,25 @@ func (d *Dumper) DumpAndParse(h ParseHandler) error {
 	}()
 
 	err := d.Dump(w)
+	_ = w.CloseWithError(err)
+
+	err = <-done
+
+	return errors.Trace(err)
+}
+
+// DumpTableAndParse dumps a single table and parses its output immediately.
+func (d *Dumper) DumpTableAndParse(db, table string, h ParseHandler) error {
+	r, w := io.Pipe()
+
+	done := make(chan error, 1)
+	go func() {
+		err := Parse(r, h, !d.masterDataSkipped)
+		_ = r.CloseWithError(err)
+		done <- err
+	}()
+
+	err := d.DumpTable(db, table, w)
 	_ = w.CloseWithError(err)
 
 	err = <-done

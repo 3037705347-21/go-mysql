@@ -28,6 +28,27 @@ type EventHandler interface {
 	String() string
 }
 
+// SnapshotEventHandler is an optional extension of EventHandler used by the
+// resumable initial snapshot (see DumpConfig.StateDir). When the registered
+// EventHandler implements it, snapshot rows are delivered as whole batches
+// instead of one RowsEvent per row, giving the downstream a natural unit for
+// transactional bulk writes. A batch is marked durably complete only after
+// OnSnapshotBatch returns, so a crash inside a batch redelivers the whole
+// batch on resume: implementations must be idempotent.
+type SnapshotEventHandler interface {
+	// OnSnapshotTableBegin is called before the first batch of a table is
+	// (re-)delivered. Completed tables are skipped on resume, so this is
+	// called at most once per table across all attempts.
+	OnSnapshotTableBegin(db string, table string) error
+	// OnSnapshotBatch delivers one snapshot batch of INSERT rows. batch is the
+	// 1-numbered batch sequence within the table; it is contiguous across
+	// resumes (a resumed table continues at the first uncommitted sequence).
+	OnSnapshotBatch(e *RowsEvent, batch uint64) error
+	// OnSnapshotTableEnd is called after the final batch of a table is
+	// persisted, marking the table fully imported.
+	OnSnapshotTableEnd(db string, table string) error
+}
+
 type DummyEventHandler struct{}
 
 func (h *DummyEventHandler) OnRotate(*replication.EventHeader, *replication.RotateEvent) error {

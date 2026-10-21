@@ -48,6 +48,19 @@ type DumpConfig struct {
 
 	// Set extra options
 	ExtraOptions []string `toml:"extra_options"`
+
+	// StateDir, when set, enables the resumable snapshot handoff: the initial
+	// dump is executed table by table in batches and its progress, the binlog
+	// start point and the snapshot/incremental handoff are persisted here.
+	// After a crash mid-dump, canal resumes per table (re-delivering only the
+	// unfinished batch) instead of re-importing everything. Incremental sync
+	// starts only after a complete handoff record is found in this directory.
+	// When empty, canal keeps the legacy single-shot dump behavior.
+	StateDir string `toml:"state_dir"`
+
+	// SnapshotBatchSize is the number of snapshot rows delivered downstream as
+	// one batch and the resumable progress unit. 0 means default (1000).
+	SnapshotBatchSize int `toml:"snapshot_batch_size"`
 }
 
 type Config struct {
