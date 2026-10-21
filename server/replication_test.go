@@ -152,3 +152,43 @@ func TestParseBinlogDump(t *testing.T) {
 		})
 	}
 }
+
+func TestParseBinlogDumpRequest(t *testing.T) {
+	data := make([]byte, 10)
+	binary.LittleEndian.PutUint32(data[0:4], 12345) // pos
+	binary.LittleEndian.PutUint32(data[4:8], 42)    // server id
+	data = append(data, []byte("mysql-bin.000007")...)
+
+	serverID, pos, err := ParseBinlogDumpRequest(data)
+	require.NoError(t, err)
+	require.Equal(t, uint32(42), serverID)
+	require.Equal(t, mysql.Position{Name: "mysql-bin.000007", Pos: 12345}, pos)
+
+	_, _, err = ParseBinlogDumpRequest([]byte{0x01, 0x02})
+	require.Equal(t, mysql.ErrMalformPacket, err)
+}
+
+func TestParseBinlogDumpGTIDRequest(t *testing.T) {
+	gtidSet, err := mysql.ParseMysqlGTIDSet("a9d88f83-c14e-11ec-be16-0242ac110002:1-10")
+	require.NoError(t, err)
+	gtidData := gtidSet.Encode()
+
+	data := make([]byte, 0, 100)
+	data = append(data, 0x00, 0x04)             // flags (2 bytes)
+	data = append(data, 0x07, 0x00, 0x00, 0x00) // server_id = 7 (4 bytes)
+	data = append(data, 0x00, 0x00, 0x00, 0x00) // name_len = 0 (4 bytes)
+	data = append(data, make([]byte, 8)...)     // binlog-pos (8 bytes)
+
+	gtidLen := make([]byte, 4)
+	binary.LittleEndian.PutUint32(gtidLen, uint32(len(gtidData)))
+	data = append(data, gtidLen...)
+	data = append(data, gtidData...)
+
+	serverID, result, err := ParseBinlogDumpGTIDRequest(data)
+	require.NoError(t, err)
+	require.Equal(t, uint32(7), serverID)
+	require.Equal(t, "a9d88f83-c14e-11ec-be16-0242ac110002:1-10", result.String())
+
+	_, _, err = ParseBinlogDumpGTIDRequest([]byte{0x00, 0x04})
+	require.Equal(t, mysql.ErrMalformPacket, err)
+}

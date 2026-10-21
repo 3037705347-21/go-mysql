@@ -42,6 +42,15 @@ type ReplicationHandler interface {
 	HandleBinlogDumpGTID(gtidSet *mysql.MysqlGTIDSet) (*replication.BinlogStreamer, error)
 }
 
+// ReplicationServerIDHandler is an optional extension of ReplicationHandler for
+// handlers that need the requesting replica's server id, for example to enforce
+// per-replica leases. When a handler implements both interfaces, the server id
+// aware methods take precedence.
+type ReplicationServerIDHandler interface {
+	HandleBinlogDumpWithServerID(serverID uint32, pos mysql.Position) (*replication.BinlogStreamer, error)
+	HandleBinlogDumpGTIDWithServerID(serverID uint32, gtidSet *mysql.MysqlGTIDSet) (*replication.BinlogStreamer, error)
+}
+
 // HandleCommand is handling commands received by the server
 // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_command_phase.html
 func (c *Conn) HandleCommand() error {
@@ -158,9 +167,16 @@ func (c *Conn) dispatch(data []byte) any {
 		return c.h.HandleOtherCommand(cmd, data)
 	case mysql.COM_BINLOG_DUMP:
 		if h, ok := c.h.(ReplicationHandler); ok {
-			pos, err := parseBinlogDump(data)
+			serverID, pos, err := ParseBinlogDumpRequest(data)
 			if err != nil {
 				return err
+			}
+			if h2, ok := c.h.(ReplicationServerIDHandler); ok {
+				s, err := h2.HandleBinlogDumpWithServerID(serverID, pos)
+				if err != nil {
+					return err
+				}
+				return s
 			}
 			s, err := h.HandleBinlogDump(pos)
 			if err != nil {
@@ -171,9 +187,16 @@ func (c *Conn) dispatch(data []byte) any {
 		return c.h.HandleOtherCommand(cmd, data)
 	case mysql.COM_BINLOG_DUMP_GTID:
 		if h, ok := c.h.(ReplicationHandler); ok {
-			gtidSet, err := parseBinlogDumpGTID(data)
+			serverID, gtidSet, err := ParseBinlogDumpGTIDRequest(data)
 			if err != nil {
 				return err
+			}
+			if h2, ok := c.h.(ReplicationServerIDHandler); ok {
+				s, err := h2.HandleBinlogDumpGTIDWithServerID(serverID, gtidSet)
+				if err != nil {
+					return err
+				}
+				return s
 			}
 			s, err := h.HandleBinlogDumpGTID(gtidSet)
 			if err != nil {

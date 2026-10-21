@@ -6,21 +6,38 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 )
 
-func parseBinlogDump(data []byte) (mysql.Position, error) {
+// ParseBinlogDumpRequest parses the payload of COM_BINLOG_DUMP and returns the
+// requesting replica's server id together with the requested start position.
+//
+// Payload layout: binlog-pos (4 bytes), flags (2 bytes), server-id (4 bytes),
+// binlog-filename (rest of the packet).
+func ParseBinlogDumpRequest(data []byte) (uint32, mysql.Position, error) {
 	if len(data) < 10 {
-		return mysql.Position{}, mysql.ErrMalformPacket
+		return 0, mysql.Position{}, mysql.ErrMalformPacket
 	}
-	var p mysql.Position
-	p.Pos = binary.LittleEndian.Uint32(data[0:4])
-	p.Name = string(data[10:])
+	serverID := binary.LittleEndian.Uint32(data[4:8])
+	p := mysql.Position{
+		Pos:  binary.LittleEndian.Uint32(data[0:4]),
+		Name: string(data[10:]),
+	}
 
-	return p, nil
+	return serverID, p, nil
 }
 
-func parseBinlogDumpGTID(data []byte) (*mysql.MysqlGTIDSet, error) {
+func parseBinlogDump(data []byte) (mysql.Position, error) {
+	_, p, err := ParseBinlogDumpRequest(data)
+	return p, err
+}
+
+// ParseBinlogDumpGTIDRequest parses the payload of COM_BINLOG_DUMP_GTID and
+// returns the requesting replica's server id together with the requested GTID
+// set.
+func ParseBinlogDumpGTIDRequest(data []byte) (uint32, *mysql.MysqlGTIDSet, error) {
 	if len(data) < 22 {
-		return nil, mysql.ErrMalformPacket
+		return 0, nil, mysql.ErrMalformPacket
 	}
+
+	serverID := binary.LittleEndian.Uint32(data[2:6])
 
 	pos := 0
 	pos += 2 // flags
@@ -31,7 +48,7 @@ func parseBinlogDumpGTID(data []byte) (*mysql.MysqlGTIDSet, error) {
 	pos += 4
 
 	if len(data) < pos+nameSize+8+4 {
-		return nil, mysql.ErrMalformPacket
+		return 0, nil, mysql.ErrMalformPacket
 	}
 
 	pos += nameSize // binlog filename
@@ -42,9 +59,18 @@ func parseBinlogDumpGTID(data []byte) (*mysql.MysqlGTIDSet, error) {
 	pos += 4
 
 	if len(data) < pos+dataSize {
-		return nil, mysql.ErrMalformPacket
+		return 0, nil, mysql.ErrMalformPacket
 	}
 
 	// parse GTID set
-	return mysql.DecodeMysqlGTIDSet(data[pos : pos+dataSize])
+	gtidSet, err := mysql.DecodeMysqlGTIDSet(data[pos : pos+dataSize])
+	if err != nil {
+		return 0, nil, err
+	}
+	return serverID, gtidSet, nil
+}
+
+func parseBinlogDumpGTID(data []byte) (*mysql.MysqlGTIDSet, error) {
+	_, gtidSet, err := ParseBinlogDumpGTIDRequest(data)
+	return gtidSet, err
 }
